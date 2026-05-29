@@ -1,0 +1,22 @@
+# Python Caches & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# Local SQLite databases & sandbox runtimes
+runtime/app.db
+runtime/db_runtime.py
+runtime/api_runtime.py
+runtime/static/
+
+# Frontend Node modules and local envs
+frontend/node_modules/
+frontend/dist/
+frontend/.env*
+
+# Built static assets for local FastAPI server
+static/
