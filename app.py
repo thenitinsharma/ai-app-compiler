@@ -2,8 +2,9 @@ import os
 import time
 import sqlite3
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import FileResponse, HTMLResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -34,6 +35,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(BASE_DIR, "runtime")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
+# Public base URL for sandbox proxy
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://127.0.0.1:8000")
+
+# Ensure required directories exist
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+
 # Instantiate Sandbox Manager
 sandbox_mgr = SandboxManager(RUNTIME_DIR)
 
@@ -48,6 +56,39 @@ class SandboxLaunchRequest(BaseModel):
     db_schema: dict
     auth_schema: dict
 
+# ── Sandbox Proxy Routes ────────────────────────────────────────────────────
+
+@app.get("/sandbox-preview")
+async def sandbox_preview_root():
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get("http://127.0.0.1:8001/")
+            return HTMLResponse(content=resp.text, status_code=resp.status_code)
+        except Exception:
+            return HTMLResponse("<h2>Sandbox is not running. Please compile an app first.</h2>", status_code=503)
+
+@app.api_route("/sandbox-preview/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def sandbox_proxy(path: str, request: Request):
+    sandbox_url = f"http://127.0.0.1:8001/{path}"
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=sandbox_url,
+                headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
+                content=await request.body(),
+                params=request.query_params,
+            )
+            return StreamingResponse(
+                content=iter([resp.content]),
+                status_code=resp.status_code,
+                headers=dict(resp.headers),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Sandbox unreachable: {str(e)}")
+
+# ── API Routes ───────────────────────────────────────────────────────────────
+
 @app.post("/api/sandbox/launch")
 def launch_sandbox(req: SandboxLaunchRequest):
     try:
@@ -60,13 +101,9 @@ def launch_sandbox(req: SandboxLaunchRequest):
             "auth_schema": req.auth_schema
         }
         
-        # Translate to backend-compatible schemas
         translated_schemas = translate_llm_schemas(raw_llm_schemas)
-        
-        # Run stage 4 validator (checks relational constraints)
         validation = validate_schemas(translated_schemas)
         
-        # Repair if invalid (e.g. missing db column or roles)
         repaired_schemas = translated_schemas
         repair_log = {"repairs": [], "retry_count": 0, "max_retries_hit": False}
         if not validation["valid"]:
@@ -79,7 +116,6 @@ def launch_sandbox(req: SandboxLaunchRequest):
                 detail=f"Compiler Error: Failed to resolve translated schema constraints. Errors: {validation['errors']}"
             )
             
-        # Extract module names as string list to avoid Attribute Error in code generator
         raw_modules = raw_llm_schemas["architecture"].get("entities", [])
         modules_list = []
         for m in raw_modules:
@@ -94,7 +130,6 @@ def launch_sandbox(req: SandboxLaunchRequest):
         }
         manifest = generate_runtime(repaired_schemas, RUNTIME_DIR, blueprint)
         
-        # Launch Sandbox
         sandbox_started = sandbox_mgr.start(port=8001)
         
         return {
@@ -104,7 +139,7 @@ def launch_sandbox(req: SandboxLaunchRequest):
             "runtime_manifest": manifest,
             "schemas": repaired_schemas,
             "sandbox": {
-                "url": "http://127.0.0.1:8001/",
+                "url": f"{BASE_URL}/sandbox-preview",
                 "online": sandbox_started
             }
         }
@@ -122,30 +157,24 @@ def compile_application(req: CompileRequest):
     metrics = {}
     total_start = time.perf_counter()
 
-    # --- CLASSIFY & STAGE 1: INTENT EXTRACTION ---
     st1_start = time.perf_counter()
     extracted = extract_intent(prompt)
     metrics["intent_extraction_ms"] = round((time.perf_counter() - st1_start) * 1000, 2)
     classification = extracted["classification"]
     intent_ir = extracted["intent_ir"]
 
-    # --- STAGE 2: SYSTEM DESIGN ---
     st2_start = time.perf_counter()
     blueprint = design_system(intent_ir)
     metrics["system_design_ms"] = round((time.perf_counter() - st2_start) * 1000, 2)
 
-    # --- STAGE 3: SCHEMA GENERATION ---
-    # We deliberately set inject_bug=True to demonstrate the validation & repair phases
     st3_start = time.perf_counter()
     raw_schemas = generate_schemas(blueprint, inject_bug=True)
     metrics["schema_generation_ms"] = round((time.perf_counter() - st3_start) * 1000, 2)
 
-    # --- STAGE 4: VALIDATION ENGINE (PRE-REPAIR) ---
     st4_start = time.perf_counter()
     validation_pre = validate_schemas(raw_schemas)
     metrics["validation_pre_ms"] = round((time.perf_counter() - st4_start) * 1000, 2)
 
-    # --- STAGE 5: REPAIR ENGINE (IF INVALID) ---
     repaired_schemas = raw_schemas
     repair_log = {
         "repairs": [],
@@ -159,7 +188,6 @@ def compile_application(req: CompileRequest):
         repaired_schemas, repair_log = repair_schemas(raw_schemas, validation_pre, retry_count=1)
         metrics["repair_ms"] = round((time.perf_counter() - st5_start) * 1000, 2)
         
-        # Re-validate repaired schemas
         st4_post_start = time.perf_counter()
         validation_post = validate_schemas(repaired_schemas)
         metrics["validation_post_ms"] = round((time.perf_counter() - st4_post_start) * 1000, 2)
@@ -167,7 +195,6 @@ def compile_application(req: CompileRequest):
         metrics["repair_ms"] = 0.0
         metrics["validation_post_ms"] = 0.0
 
-    # --- STAGE 6: RUNTIME EXECUTION ---
     if not validation_post["valid"]:
         raise HTTPException(
             status_code=500,
@@ -178,7 +205,6 @@ def compile_application(req: CompileRequest):
     manifest = generate_runtime(repaired_schemas, RUNTIME_DIR, blueprint)
     metrics["runtime_generation_ms"] = round((time.perf_counter() - st6_start) * 1000, 2)
 
-    # --- START SANDBOX PREVIEW ---
     sandbox_started = sandbox_mgr.start(port=8001)
     
     metrics["total_compile_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
@@ -197,17 +223,13 @@ def compile_application(req: CompileRequest):
             "runtime_manifest": manifest
         },
         "sandbox": {
-            "url": "http://127.0.0.1:8001/",
+            "url": f"{BASE_URL}/sandbox-preview",
             "online": sandbox_started
         }
     }
 
 @app.get("/api/sandbox/db-records")
 def get_sandbox_db_records():
-    """
-    Developer Debugger endpoint. Queries the live compiled SQLite DB file
-    and returns all tables and their records.
-    """
     db_path = os.path.join(RUNTIME_DIR, "app.db")
     if not os.path.exists(db_path):
         return {"tables": {}, "message": "Database not initialized. Please compile the app first."}
@@ -217,7 +239,6 @@ def get_sandbox_db_records():
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Get list of tables
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = [row[0] for row in cursor.fetchall() if not row[0].startswith("sqlite_")]
         
@@ -226,7 +247,6 @@ def get_sandbox_db_records():
             columns = [col[0] for col in cursor.description]
             rows = cursor.fetchall()
             
-            # Format rows as list of dicts
             table_rows = []
             for r in rows:
                 table_rows.append(dict(zip(columns, r)))
@@ -245,7 +265,6 @@ def stop_sandbox():
 
 @app.on_event("shutdown")
 def shutdown_event():
-    # Make sure to kill any background sandbox when compiler shuts down
     sandbox_mgr.stop()
 
 # Serve compiler dashboard home
@@ -264,7 +283,7 @@ def get_dashboard():
     return HTMLResponse("<h1>Compiler Dashboard UI is compiling... Please wait</h1>")
 
 # Mount Static Files Directory
-if os.path.exists(STATIC_DIR):
+if os.path.exists(STATIC_DIR) and os.listdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 if __name__ == "__main__":
